@@ -30,7 +30,11 @@ non-obvious traps are avoided, then measure what is left for a KV paging scheme 
 | `draft-mtp` n_max=6/8 | 46.8 / 41.5 | collapses |
 
 E2E (DeliverableBench ocr-dual-channel, `pi` agent, thinking off, 57,344 ctx):
-see the parent project's `references/llama-next-mtp5-experiment.md`.
+**100.0/100 in 433 s (7.2 min)** with `--presence-penalty 1.5` and MTP-5 — the presence
+penalty is not cosmetic: it suppresses the agent's repetition loops and lifts MTP
+acceptance from 45-56% to 72.8% (mean accepted length 5.07), giving server-side decode
+p50 65.8 / max 79.7 tok/s. See the parent project's
+`references/llama-next-mtp5-experiment.md` for the full run table (R1/R2/R3).
 
 ## Files
 

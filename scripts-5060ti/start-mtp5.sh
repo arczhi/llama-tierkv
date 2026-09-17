@@ -14,6 +14,10 @@
 #   --spec-draft-type-k/v q4_0    : draft KV is tiny (1 layer); q4_0 saves ~70 MiB
 #   --reasoning off               : keep agent output plain (matches the repo's other runs)
 #   --temp 0.7 --top-p 0.8 --top-k 20 : Qwen3.8 non-thinking sampling defaults
+#   --presence-penalty 1.5        : copied from the KVMem run's sampling profile. Measured
+#                                    effect (R3 agent E2E): suppresses the agent's repetition
+#                                    loops AND raises MTP acceptance 45-56% -> 72.8%
+#                                    (mean accepted length 5.07/pass, decode p50 65.8 tok/s)
 #
 # Measured on RTX 5060 Ti 16GB / Ryzen 9 9950X (2026-09-17):
 #   no spec       : 25.7 tok/s decode
@@ -43,5 +47,5 @@ exec "$BUILD/bin/llama-server" \
   -ngl 99 --spec-draft-ngl 99 \
   --parallel 1 --jinja \
   --reasoning off \
-  --temp 0.7 --top-p 0.8 --top-k 20 \
+  --temp 0.7 --top-p 0.8 --top-k 20 --presence-penalty 1.5 \
   --metrics "$@"

@@ -1,0 +1,11 @@
+{
+  "tag": "llama-next-mtp5",
+  "provider": "llama_next",
+  "model": "qwen38-next",
+  "task": "ocr-dual-channel",
+  "repo": "fixtures/video-multimodal-feature",
+  "started_at": "2026-09-17T17:17:16",
+  "steers": [],
+  "timed_out": false,
+  "notes": "mainline llama.cpp c77ae69 + draft-mtp n_max=5, ctx 57344, q4_0 KV; pi launched directly; ~10 min of wall time lost to an agent-side catastrophic-regex bash command (killed)"
+}

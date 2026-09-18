@@ -1,0 +1,47 @@
+{
+  "tag": "llama-next-mtp5",
+  "model": "qwen38-next",
+  "provider": "llama_next",
+  "task": "ocr-dual-channel",
+  "wall_time_s": null,
+  "started_at": "2026-09-17T17:17:16",
+  "finished_at": null,
+  "total_input_tokens": 39791,
+  "total_output_tokens": 13171,
+  "tool_calls": {
+    "bash": 45,
+    "read": 3,
+    "write": 3,
+    "edit": 14
+  },
+  "score": 100.0,
+  "detail": {
+    "deliverables": {
+      "score": 40,
+      "max": 40,
+      "design_doc": true,
+      "channel_module": true,
+      "wiring_points": 4,
+      "new_test": true
+    },
+    "tests": {
+      "score": 30,
+      "max": 30,
+      "passed": 75,
+      "full_green": true
+    },
+    "completion": {
+      "score": 15,
+      "max": 15,
+      "has_summary_text": true
+    },
+    "behavior": {
+      "score": 15.0,
+      "max": 15,
+      "bash_calls": 45,
+      "adjacent_dup_rate": 0.0,
+      "steer_count": 0,
+      "timed_out": false
+    }
+  }
+}

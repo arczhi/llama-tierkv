@@ -1,0 +1,13 @@
+{
+  "tag": "llama-next-mtp5-r3",
+  "provider": "llama_next",
+  "model": "qwen38-next",
+  "task": "ocr-dual-channel",
+  "repo": "fixtures/video-multimodal-feature",
+  "started_at": "2026-09-17T18:01:10",
+  "finished_at": "2026-09-17T18:08:23",
+  "wall_time_s": 433.0,
+  "steers": [],
+  "timed_out": false,
+  "notes": "mainline llama.cpp + draft-mtp n_max=5, ctx 57344, q4_0 KV, sampling matched to kvmem (temp0.7/top_p0.8/top_k20/presence1.5), reasoning off"
+}

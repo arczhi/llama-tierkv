@@ -1,0 +1,31 @@
+===== N4_t0 (temp=0.0) :: -ctk q5_0 -ctv q5_0 --spec-type draft-mtp --spec-draft-type-k q8_0 --spec-draft-type-v q8_0 --spec-draft-n-max 4
+[N4_t0] prompt tokens = 8023
+  run1: {"wall_s": 18.38, "prompt_n": 8075, "prompt_ms": 8879.478, "prompt_tps": 909.4, "predicted_n": 512, "predicted_ms": 9493.658, "decode_tps": 53.83, "draft_n": 617, "draft_accepted": 356, "accept_pct": 57.7}
+  run2: {"wall_s": 18.26, "prompt_n": 8075, "prompt_ms": 8885.336, "prompt_tps": 908.8, "predicted_n": 512, "predicted_ms": 9372.538, "decode_tps": 54.52, "draft_n": 609, "draft_accepted": 358, "accept_pct": 58.8}
+  run3: {"wall_s": 18.3, "prompt_n": 8075, "prompt_ms": 8901.117, "prompt_tps": 907.2, "predicted_n": 512, "predicted_ms": 9390.97, "decode_tps": 54.41, "draft_n": 609, "draft_accepted": 358, "accept_pct": 58.8}
+[N4_t0] decode median = 54.41 tok/s (min 53.83, max 54.52)
+===== N6_t0 (temp=0.0) :: -ctk q5_0 -ctv q5_0 --spec-type draft-mtp --spec-draft-type-k q8_0 --spec-draft-type-v q8_0 --spec-draft-n-max 6
+[N6_t0] prompt tokens = 8023
+  run1: {"wall_s": 20.17, "prompt_n": 8075, "prompt_ms": 8931.802, "prompt_tps": 904.1, "predicted_n": 512, "predicted_ms": 11228.911, "decode_tps": 45.51, "draft_n": 903, "draft_accepted": 360, "accept_pct": 39.9}
+  run2: {"wall_s": 19.85, "prompt_n": 8075, "prompt_ms": 8924.656, "prompt_tps": 904.8, "predicted_n": 512, "predicted_ms": 10917.6, "decode_tps": 46.81, "draft_n": 878, "draft_accepted": 364, "accept_pct": 41.5}
+  run3: {"wall_s": 19.79, "prompt_n": 8075, "prompt_ms": 8932.156, "prompt_tps": 904.0, "predicted_n": 512, "predicted_ms": 10850.853, "decode_tps": 47.09, "draft_n": 872, "draft_accepted": 365, "accept_pct": 41.9}
+[N6_t0] decode median = 46.81 tok/s (min 45.51, max 47.09)
+===== N8_t0 (temp=0.0) :: -ctk q5_0 -ctv q5_0 --spec-type draft-mtp --spec-draft-type-k q8_0 --spec-draft-type-v q8_0 --spec-draft-n-max 8
+[N8_t0] prompt tokens = 8023
+  run1: {"wall_s": 21.44, "prompt_n": 8075, "prompt_ms": 8944.412, "prompt_tps": 902.8, "predicted_n": 512, "predicted_ms": 12491.997, "decode_tps": 40.91, "draft_n": 1199, "draft_accepted": 360, "accept_pct": 30.0}
+  run2: {"wall_s": 21.24, "prompt_n": 8075, "prompt_ms": 8926.807, "prompt_tps": 904.6, "predicted_n": 512, "predicted_ms": 12308.048, "decode_tps": 41.52, "draft_n": 1183, "draft_accepted": 362, "accept_pct": 30.6}
+  run3: {"wall_s": 21.25, "prompt_n": 8075, "prompt_ms": 8930.505, "prompt_tps": 904.2, "predicted_n": 512, "predicted_ms": 12309.515, "decode_tps": 41.51, "draft_n": 1183, "draft_accepted": 362, "accept_pct": 30.6}
+[N8_t0] decode median = 41.51 tok/s (min 40.91, max 41.52)
+===== N5_t07 (temp=0.7) :: -ctk q5_0 -ctv q5_0 --spec-type draft-mtp --spec-draft-type-k q8_0 --spec-draft-type-v q8_0 --spec-draft-n-max 5
+[N5_t07] prompt tokens = 8023
+  run1: {"wall_s": 21.25, "prompt_n": 8075, "prompt_ms": 8936.444, "prompt_tps": 903.6, "predicted_n": 512, "predicted_ms": 12309.394, "decode_tps": 41.51, "draft_n": 907, "draft_accepted": 329, "accept_pct": 36.3}
+  run2: {"wall_s": 19.55, "prompt_n": 8075, "prompt_ms": 8928.953, "prompt_tps": 904.4, "predicted_n": 512, "predicted_ms": 10610.433, "decode_tps": 48.16, "draft_n": 780, "draft_accepted": 354, "accept_pct": 45.4}
+  run3: {"wall_s": 18.88, "prompt_n": 8075, "prompt_ms": 8934.929, "prompt_tps": 903.8, "predicted_n": 512, "predicted_ms": 9942.826, "decode_tps": 51.39, "draft_n": 732, "draft_accepted": 364, "accept_pct": 49.7}
+[N5_t07] decode median = 48.16 tok/s (min 41.51, max 51.39)
+===== N8_t07 (temp=0.7) :: -ctk q5_0 -ctv q5_0 --spec-type draft-mtp --spec-draft-type-k q8_0 --spec-draft-type-v q8_0 --spec-draft-n-max 8
+[N8_t07] prompt tokens = 8023
+  run1: {"wall_s": 21.61, "prompt_n": 8075, "prompt_ms": 8949.832, "prompt_tps": 902.3, "predicted_n": 512, "predicted_ms": 12651.835, "decode_tps": 40.39, "draft_n": 1211, "draft_accepted": 358, "accept_pct": 29.6}
+  run2: {"wall_s": 21.67, "prompt_n": 8075, "prompt_ms": 8935.211, "prompt_tps": 903.7, "predicted_n": 512, "predicted_ms": 12724.954, "decode_tps": 40.16, "draft_n": 1226, "draft_accepted": 357, "accept_pct": 29.1}
+  run3: {"wall_s": 23.15, "prompt_n": 8075, "prompt_ms": 8939.531, "prompt_tps": 903.3, "predicted_n": 512, "predicted_ms": 14201.572, "decode_tps": 35.98, "draft_n": 1363, "draft_accepted": 339, "accept_pct": 24.9}
+[N8_t07] decode median = 40.16 tok/s (min 35.98, max 40.39)
+SWEEP2 DONE

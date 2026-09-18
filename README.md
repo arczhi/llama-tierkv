@@ -114,6 +114,11 @@ cold-path session mechanism, not a per-token source of KV data.
 | **TierKV full stack** | **window 49,152, Q4_0 KV + host store, hybrid selector, MTP-5** | **100.0** | **398 s** | 62.1 tok/s |
 | KVMem reference (separate fork) | 262K logical, 32K retrieved window, MTP-3 | 100.0 | 482 s | 50.3 tok/s |
 
+> KVMem reference project: <https://github.com/kvmem/kvmem-llama.cpp>
+> (its scheme is described in the llama.cpp discussion
+> <https://github.com/ggml-org/llama.cpp/discussions/28894>).
+> Numbers above are from the same machine, task and agent as the TierKV and baseline runs.
+
 The TierKV run completed with 0 human corrections, 72/72 tests green, 40/40 deliverables.
 
 ### Long context — single request, no speculation
@@ -206,7 +211,7 @@ Key TierKV environment variables (all optional; the fork is stock llama.cpp when
 - Built on [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT) — all upstream code and
   credit belongs to the llama.cpp authors.
 - Model: `Qwen3.8-27B-UD-IQ4_XS` (Unsloth), MTP head requantized to Q4_0.
-- The comparison point is [KVMem](https://github.com/kvmem/kvmem-llama.cpp); TierKV is an
+- The comparison point is **KVMem**: <https://github.com/kvmem/kvmem-llama.cpp>; TierKV is an
   independent design (three-tier store + page-sparse selection) that shares the goal of long
   agent contexts on small cards.
 - Data and full experiment reports live in the companion repository

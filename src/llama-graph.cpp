@@ -7,6 +7,7 @@
 #include "llama-sampler.h"
 
 #include "llama-kv-cache.h"
+#include "llama-memory-hybrid.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsa.h"
 #include "llama-kv-cache-dsa-iswa.h"
@@ -2600,6 +2601,22 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                float   kq_scale,
                  int   il) const {
     const bool v_trans = v->nb[1] > v->nb[2];
+
+    // kv pager: capture the first query head of the last token for page-sparse selection
+    if (mctx != nullptr) {
+        auto * hctx = dynamic_cast<const llama_memory_hybrid_context *>(mctx);
+        auto * kv_cache = (hctx != nullptr && hctx->get_attn() != nullptr) ? hctx->get_attn()->get_cache() : nullptr;
+        if (kv_cache != nullptr && kv_cache->get_pager() != nullptr && kv_cache->get_pager()->enabled) {
+            ggml_tensor * q_cap = kv_cache->get_q_capture(il);
+            if (q_cap != nullptr && q->ne[2] > 0) {
+                const int64_t n_tok = q->ne[2];
+                ggml_tensor * q_src = ggml_view_2d(ctx0, q, q->ne[0], 1, q->nb[1], (n_tok - 1)*q->nb[2]);
+                ggml_tensor * q_dst = ggml_view_2d(ctx0, q_cap, q->ne[0], 1, q_cap->nb[1], 0);
+                ggml_tensor * cpy = ggml_cpy(ctx0, q_src, q_dst);
+                ggml_build_forward_expand(gf, cpy);
+            }
+        }
+    }
 
     // split the batch into streams if needed
     const auto n_stream = k->ne[3];

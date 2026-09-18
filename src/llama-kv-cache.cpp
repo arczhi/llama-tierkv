@@ -244,6 +244,11 @@ llama_kv_cache::llama_kv_cache(
             v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
         }
 
+        // kv pager: query capture for page-sparse selection (first query head, last token)
+        ggml_tensor * q_cap = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hparams.n_embd_head_k(il), 1);
+        ggml_format_name(q_cap, "pager_q_%d", il);
+        q_caps.push_back(q_cap);
+
         map_layer_ids[il] = layers.size();
 
         layers.push_back({ il, k, v, k_stream, v_stream, });
@@ -395,6 +400,11 @@ void llama_kv_cache::pager_init() {
     pager = std::make_unique<llama_kv_pager>();
     if (!pager->init(refs, k_row, v_row, type_k, type_v, n_embd_k, n_embd_v)) {
         pager.reset();
+        return;
+    }
+
+    if (!q_caps.empty() && q_caps[0] != nullptr) {
+        pager->set_q_captures(q_caps, q_caps[0]->ne[0]);
     }
 }
 
@@ -517,7 +527,20 @@ void llama_kv_cache::pager_stage(const llama_ubatch & ubatch) {
     const uint32_t nq = std::min<uint32_t>(ubatch.n_tokens, pager->query_len);
     const llama_token * q = ubatch.token + (ubatch.n_tokens - nq);
 
-    const auto blocks = pager->select_blocks(q, nq);
+    auto blocks = pager->select_blocks(q, nq);
+
+    // page-sparse attention selector: rank pages with q * max(kmin, kmax)
+    if (pager->select_mode != 0 && ubatch.n_tokens <= 8) {
+        auto attn_blocks = pager->select_blocks_attn();
+        if (pager->select_mode == 1) {
+            blocks = std::move(attn_blocks);
+        } else if (pager->select_mode == 2) {
+            for (const auto b : attn_blocks) {
+                blocks.push_back(b);
+            }
+        }
+    }
+
     if (blocks.empty()) {
         return;
     }
@@ -1490,6 +1513,14 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     return layers[ikv].k;
+}
+
+ggml_tensor * llama_kv_cache::get_q_capture(int32_t il) const {
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) return nullptr;
+    const int32_t ikv = it->second;
+    if (ikv < 0 || (size_t) ikv >= q_caps.size()) return nullptr;
+    return q_caps[ikv];
 }
 
 const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {

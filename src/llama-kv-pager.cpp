@@ -4,6 +4,7 @@
 #include "llama-impl.h"
 
 #include <cstdlib>
+#include <limits>
 
 #include <algorithm>
 #include <cstdarg>
@@ -11,6 +12,12 @@
 #include <cstring>
 #include <unordered_map>
 #include <unordered_set>
+
+static bool g_pager_disabled = false;
+
+void llama_kv_pager_set_disabled(bool value) {
+    g_pager_disabled = value;
+}
 
 static bool env_flag(const char * name, bool def = false) {
     const char * v = getenv(name);
@@ -41,7 +48,7 @@ static bool row_is_convertible(ggml_type t) {
 bool llama_kv_pager::init(const std::vector<layer_ref> & layers_in, size_t k_row_cache_in, size_t v_row_cache_in,
                           ggml_type type_k_cache_in, ggml_type type_v_cache_in,
                           int64_t n_embd_k_in, int64_t n_embd_v_in) {
-    enabled = env_flag("LLAMA_KV_PAGER", false);
+    enabled = !g_pager_disabled && env_flag("LLAMA_KV_PAGER", false);
     if (!enabled) return false;
 
     max_ctx      = env_u32("LLAMA_KV_PAGER_MAX_CTX", 262144);
@@ -68,6 +75,13 @@ bool llama_kv_pager::init(const std::vector<layer_ref> & layers_in, size_t k_row
     k_row = host_q4 ? ggml_row_size(type_k_host, n_embd_k) : k_row_cache;
     v_row = host_q4 ? ggml_row_size(type_v_host, n_embd_v) : v_row_cache;
     autosave_every = env_u32("LLAMA_KV_PAGER_AUTOSAVE", 0);
+    attn_step = (int) env_u32("LLAMA_KV_PAGER_ATTN_STEP", 8);
+    if (attn_step < 1) attn_step = 1;
+    select_mode = 0;
+    if (const char * sm = getenv("LLAMA_KV_PAGER_SELECT")) {
+        if (strcmp(sm, "attn") == 0)   select_mode = 1;
+        if (strcmp(sm, "hybrid") == 0) select_mode = 2;
+    }
     if (const char * p = getenv("LLAMA_KV_PAGER_SAVE")) save_path = p;
     if (const char * p = getenv("LLAMA_KV_PAGER_LOAD")) load_path = p;
 
@@ -184,6 +198,32 @@ void llama_kv_pager::save_row(uint32_t ikv, uint32_t cell, llama_seq_id seq, lla
                                     (size_t) cell * L.v->nb[1], v_row);
         }
     }
+    // page summaries for the attention selector: first n_sum_ch K channels
+    if (n_sum_ch > 0 && ikv < kmin.size() && L.k) {
+        std::vector<uint8_t> row(k_row_cache);
+        std::vector<float> f32(n_embd_k);
+        ggml_backend_tensor_get(L.k, row.data(), (size_t) cell * L.k->nb[1], k_row_cache);
+        const ggml_type_traits * tr = ggml_get_type_traits(type_k_cache);
+        if (tr && tr->to_float) {
+            tr->to_float(row.data(), f32.data(), n_embd_k);
+            const uint32_t page = (uint32_t) std::max<llama_pos>(0, pos) / block_tokens;
+            if (page < page_valid.size()) {
+                auto & mn = kmin[ikv];
+                auto & mx = kmax[ikv];
+                for (int64_t c = 0; c < n_sum_ch && c < n_embd_k; ++c) {
+                    const float v = f32[c];
+                    uint16_t & lo = mn[(size_t) page * n_sum_ch + c];
+                    uint16_t & hi = mx[(size_t) page * n_sum_ch + c];
+                    const float flo = ggml_fp16_to_fp32((ggml_fp16_t) lo);
+                    const float fhi = ggml_fp16_to_fp32((ggml_fp16_t) hi);
+                    lo = ggml_fp32_to_fp16(v < flo ? v : flo);
+                    hi = ggml_fp32_to_fp16(v > fhi ? v : fhi);
+                }
+                page_valid[page] = 1;
+            }
+        }
+    }
+
     slot_saved[slot] = 1;
     slot_tok[slot] = tok;
     if (ikv == 0 && tok >= 0) {
@@ -235,6 +275,67 @@ bool llama_kv_pager::load_row(uint32_t ikv, uint32_t cell, llama_seq_id seq, lla
     }
     ++n_loads;
     return true;
+}
+
+void llama_kv_pager::set_q_captures(const std::vector<ggml_tensor *> & caps, int64_t n_ch) {
+    q_caps = caps;
+    n_sum_ch = n_ch;
+    if (n_sum_ch <= 0) return;
+
+    const uint32_t n_pages = (max_ctx + block_tokens - 1) / block_tokens;
+    kmin.assign(layers.size(), {});
+    kmax.assign(layers.size(), {});
+    for (size_t il = 0; il < layers.size(); ++il) {
+        kmin[il].assign((size_t) n_pages * n_sum_ch, ggml_fp32_to_fp16( std::numeric_limits<float>::infinity()));
+        kmax[il].assign((size_t) n_pages * n_sum_ch, ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity()));
+    }
+    page_valid.assign(n_pages, 0);
+
+    fprintf(stderr, "KV-PAGER: attention selector ready (channels=%lld, pages=%u, mode=%d, step=%d)\n",
+            (long long) n_sum_ch, n_pages, select_mode, attn_step);
+}
+
+std::vector<uint32_t> llama_kv_pager::select_blocks_attn() const {
+    const uint32_t n_blocks = (max_ctx + block_tokens - 1) / block_tokens;
+    if (n_sum_ch <= 0 || q_caps.empty()) return {};
+
+    std::vector<double> score(n_blocks, 0.0);
+    std::vector<float>  q(n_sum_ch);
+
+    for (size_t il = 0; il < q_caps.size() && il < kmin.size(); ++il) {
+        if (q_caps[il] == nullptr) continue;
+        ggml_backend_tensor_get(q_caps[il], q.data(), 0, (size_t) n_sum_ch * sizeof(float));
+
+        for (uint32_t b = 0; b < n_blocks; ++b) {
+            if (!page_valid[b]) continue;
+            double s = 0.0;
+            const uint16_t * mn = kmin[il].data() + (size_t) b * n_sum_ch;
+            const uint16_t * mx = kmax[il].data() + (size_t) b * n_sum_ch;
+            for (int64_t c = 0; c < n_sum_ch; c += attn_step) {
+                const float lo = ggml_fp16_to_fp32((ggml_fp16_t) mn[c]);
+                const float hi = ggml_fp16_to_fp32((ggml_fp16_t) mx[c]);
+                s += (double) q[c] * (double) std::max(lo, hi);
+            }
+            score[b] += s;
+        }
+    }
+
+    std::vector<std::pair<double, uint32_t>> ranked;
+    for (uint32_t b = 0; b < n_blocks; ++b) {
+        if (page_valid[b] && score[b] > 0.0) ranked.emplace_back(score[b], b);
+    }
+    std::sort(ranked.begin(), ranked.end(), [](const auto & a, const auto & b) {
+        return a.first != b.first ? a.first > b.first : a.second < b.second;
+    });
+
+    std::vector<uint32_t> res;
+    for (size_t i = 0; i < ranked.size() && i < topk; ++i) res.push_back(ranked[i].second);
+    if (debug) {
+        fprintf(stderr, "KV-PAGER attn select: %zu pages scored, top:", ranked.size());
+        for (size_t i = 0; i < res.size(); ++i) fprintf(stderr, " b%u(%.2f)", res[i], ranked[i].first);
+        fprintf(stderr, "\n");
+    }
+    return res;
 }
 
 std::vector<uint32_t> llama_kv_pager::select_blocks(const llama_token * query, uint32_t n_query) const {

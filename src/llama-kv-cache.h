@@ -185,6 +185,7 @@ public:
     //
 
     llama_kv_pager * get_pager() const { return pager.get(); }
+    ggml_tensor * get_q_capture(int32_t il) const;
 
     bool pager_place(uint32_t stream, uint32_t cell, llama_seq_id seq, llama_pos pos, llama_token tok);
     bool pager_block_resident(uint32_t stream, llama_seq_id seq, uint32_t p0, uint32_t p1) const;
@@ -315,6 +316,9 @@ private:
     // host-tier KV store (disabled by default; see llama-kv-pager.h)
     std::unique_ptr<llama_kv_pager> pager;
 
+    // per kv layer: query capture for page-sparse selection
+    std::vector<ggml_tensor *> q_caps;
+
     void pager_init();
     void pager_on_evict(uint32_t stream, uint32_t cell);
 
@@ -403,6 +407,7 @@ public:
     bool apply() override;
 
     llama_memory_status  get_status() const override;
+    llama_kv_cache * get_cache() const { return kv; }
     const llama_ubatch & get_ubatch() const override;
 
     //

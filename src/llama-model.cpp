@@ -2274,9 +2274,16 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
-    // kv pager: optionally decouple the VRAM cache window from the logical context size
+    const bool is_mtp_ctx_mem = (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP);
+    llama_kv_pager_set_disabled(is_mtp_ctx_mem);
+    fprintf(stderr, "KV-PAGER create_memory: ctx_type=%d is_mtp=%d n_ctx_seq=%u arch=%d\n",
+            (int) params.ctx_type, (int) is_mtp_ctx_mem, cparams.n_ctx_seq, (int) arch);
+
+    // kv pager: optionally decouple the VRAM cache window from the logical context size.
+    // MTP draft contexts must NOT be paged: their cache has to stay aligned with the target.
+    const bool is_mtp_ctx = (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP);
     uint32_t attn_kv_size = cparams.n_ctx_seq;
-    {
+    if (!is_mtp_ctx) {
         const char * pager_env = getenv("LLAMA_KV_PAGER");
         if (pager_env && atoi(pager_env) != 0) {
             const char * w = getenv("LLAMA_KV_PAGER_WINDOW");

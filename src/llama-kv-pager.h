@@ -38,6 +38,9 @@
 
 struct llama_kv_cache;
 
+// global kill-switch used while constructing contexts that must not be paged (e.g. MTP draft)
+void llama_kv_pager_set_disabled(bool value);
+
 struct llama_kv_pager {
     struct layer_ref {
         ggml_tensor * k = nullptr;
@@ -104,6 +107,17 @@ struct llama_kv_pager {
     void     unpin_row(llama_seq_id seq, llama_pos pos);
     int32_t  slot_of  (llama_seq_id seq, llama_pos pos) const;
     uint64_t n_saved() const;
+
+    // -- attention-derived selection (page-sparse) ----------------------------
+    std::vector<ggml_tensor *> q_caps;        // per kv layer: [n_sum_ch, 1] f32 capture
+    int64_t n_sum_ch = 0;                     // summarized channels (first head-dim slice)
+    int     select_mode = 0;                  // 0 = lex, 1 = attn, 2 = hybrid
+    int     attn_step = 8;
+    std::vector<std::vector<uint16_t>> kmin;  // [layer][page * n_sum_ch] (f16 bits)
+    std::vector<std::vector<uint16_t>> kmax;
+    std::vector<uint8_t> page_valid;          // [page]
+    void set_q_captures(const std::vector<ggml_tensor *> & caps, int64_t n_ch);
+    std::vector<uint32_t> select_blocks_attn() const;
 
     // -- retrieval (2.4) ------------------------------------------------------
     // score stored blocks (block_tokens-sized) by token overlap with `query`

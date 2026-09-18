@@ -1,126 +1,187 @@
-# llama.cpp
+# TierKV
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+**An independent fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) for running end-to-end
+coding-agent tasks on consumer GPUs with limited VRAM.**
 
-<div align="center">
+Upstream base: `ggml-org/llama.cpp` @ `c77ae69` (2026-09-17). This is not a pull request to
+upstream — it is a research fork. Everything TierKV adds is opt-in via environment variables,
+so the stock llama.cpp behavior is unchanged unless enabled.
 
-<b>LLM inference in C/C++</b>
+The reference machine is a single **RTX 5060 Ti 16 GB** (16,311 MiB) with 32 GB of system RAM
+and a 3.5 GB/s NVMe, running **Qwen3.8-27B** (IQ4_XS, ~13.2 GiB) as the coding agent.
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
-[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
-[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+---
 
-[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Ajhen0409%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3Aravi9%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Awine99%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+## 1. The problem, in plain words
 
-</div>
+A 27B model at 4-bit already fills most of a 16 GB card. On top of that, every conversation
+needs a **KV cache** — the model's running memory of what has been said. It grows with the
+conversation:
 
-## Quick start
+| Conversation length | KV cache (Q4_0) | Fits next to the weights? |
+| ---: | ---: | --- |
+| 8K tokens | 0.15 GB | yes |
+| 57K tokens | 1.0 GB | barely (that is the dense ceiling we measured) |
+| 262K tokens | 4.7 GB | no |
 
-A few options to get `llama.cpp` installed on your machine:
+Agent tasks are exactly the ones that blow this up: the agent reads files, writes code, runs
+tests, reads the failures, tries again — a single session easily reaches 50-260K tokens.
+The usual answers are bad:
 
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+- **Drop old context** → the agent forgets the task and starts looping.
+- **Stream the whole cache from RAM every token** (page-in/page-out per layer) → decode
+  collapses to single-digit tok/s, because a 256K cache is ~5 GB per generated token.
+- **Buy a bigger GPU** → not the point.
 
-Once installed:
+## 2. The idea: a desk, a bookshelf, and an archive
 
-```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
+TierKV treats the KV cache like a workspace librarian treats paper:
 
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
+- **VRAM = the desk.** Only what is needed *right now*: the model weights, a bounded window of
+  recent conversation (32-49K tokens), and a handful of "recalled" older pages. Compute always
+  happens on the desk, so the attention cost is bounded no matter how long the conversation is.
+- **System RAM = the bookshelf.** As soon as a page of conversation slides off the desk it is
+  copied to host RAM — nothing is ever thrown away. At 256K tokens this costs ~4.6 GB.
+- **SSD = the archive.** The bookshelf can be written to disk and loaded back, so a restarted
+  server resumes a conversation instead of re-reading 200K tokens of history.
+
+The one rule that makes it fast: **pages move at turn boundaries, never per token.** That is
+the difference between "flat 22-62 tok/s at any context length" and "8 tok/s at 180K".
+
+Two signals decide which old pages are brought back to the desk:
+
+1. **Word overlap (IDF-weighted).** Cheap, always available, works well when the question
+   reuses the vocabulary of the thing it asks about.
+2. **Attention scores (page-sparse attention).** Each 64-token page keeps a tiny summary —
+   per-channel min/max of its K vectors. The current query (captured from inside the attention
+   graph) is scored against every page with the Quest-style upper bound
+   `sum_c q_c * max(kmin_c, kmax_c)`; the top pages are staged back into VRAM. This is the
+   "page-sparse attention" part: attention effectively runs over a *selected subset* of pages
+   plus the recent window, not over the whole history.
+
+## 3. What is in this fork
+
+| File | What it does |
+| --- | --- |
+| `src/llama-kv-pager.{h,cpp}` | The host-tier KV store: save/load rows, IDF + attention selectors, pinning, SSD snapshots |
+| `src/llama-kv-cache.{h,cpp}` | Hooks: save-on-evict (`apply_ubatch`, `seq_rm`), room making, staging in `prepare()`, head protection |
+| `src/llama-graph.cpp` | Captures the last token's query per layer (`ggml_cpy` into a persistent tensor, CUDA-graph safe) |
+| `src/llama-model.cpp` | Decouples the VRAM window from the logical context; exempts MTP contexts from paging |
+| `common/speculative.cpp` | MTP draft context size cap (experimental) |
+| `scripts-5060ti/` | The tuned launcher, a decode/prefill probe, and the page-sparse cost prototype |
+| `data/` | Raw experiment logs (sweeps, server logs, E2E artifacts) |
+
+### Policy v2 (the parts that made it transparent)
+
+- **Head protection** — the first 2,048 positions (system prompt, task spec) are never evicted.
+  Before this, "evict the oldest first" silently deleted the agent's instructions.
+- **Eviction-triggered, rate-limited staging** — stage only after new evictions, at most once
+  per 1,024 positions. Kills per-step churn; when the conversation fits the window, overhead
+  is ~zero.
+- **Batched block gather** — whole 64-token blocks are moved with one copy per layer
+  (16 copies per block instead of 1,024).
+- **Lazy store allocation** — RAM is allocated on first save; unused contexts cost nothing.
+- **MTP-context exemption** — speculative-decoding draft contexts are never paged; their KV
+  must stay position-aligned with the target.
+
+## 4. Results (measured, RTX 5060 Ti 16 GB)
+
+### Agent E2E — DeliverableBench `ocr-dual-channel`, same agent, same task
+
+| Run | Configuration | Score | Wall time | Decode p50 |
+| --- | --- | ---: | ---: | ---: |
+| Dense baseline | mainline llama.cpp, MTP-5, window = context 57,344, Q4_0 KV | 100.0 | 433 s | 65.8 tok/s |
+| **TierKV full stack** | **window 49,152, Q4_0 KV + host store, hybrid selector, MTP-5** | **100.0** | **398 s** | 62.1 tok/s |
+| KVMem reference (separate fork) | 262K logical, 32K retrieved window, MTP-3 | 100.0 | 482 s | 50.3 tok/s |
+
+The TierKV run completed with 0 human corrections, 72/72 tests green, 40/40 deliverables.
+
+### Long context — single request, no speculation
+
+| Context | Prefill | Decode |
+| ---: | ---: | ---: |
+| 132K tokens | 713 tok/s | 22.74 tok/s |
+| 262K tokens | 680 tok/s | **22.70 tok/s** |
+
+Decode is **flat from 8K to 262K** — the defining property of the design (the desk stays the
+same size). Prefill stays compute-bound because it processes only the new tokens.
+
+### Component tests
+
+| Test | Result |
+| --- | --- |
+| Bit-identical check | pager on (no evictions) vs off: identical greedy output |
+| Eviction bookkeeping | 7,769-token prompt through a 2,048-token window: 91,600 KV rows saved, no crash |
+| Needle recall (lexical) | needle page ranks #1 (score 3413 vs ~170 for filler); exact recall |
+| Needle recall (attention) | needle page ranks #1 (160.3 vs 82.1); exact recall |
+| Mixed precision | host Q4_0 / window Q5_0 (576 vs 704 B/row, -18% RAM), recall preserved |
+| SSD snapshots | fresh process, loaded 302 MB store, answers a **26-token question** with a passphrase that was never in its own prompt |
+| Memory | 4.6 GB host RAM at 256K (Q4_0 store), 15.5 GB VRAM peak |
+
+### Speculative decoding (the other half of the speed)
+
+TierKV leans on the model's built-in MTP head: at 8K context the tuned recipe goes from
+**25.7 tok/s** (no speculation) to **56.6** (n_max=3) to **63.7** (n_max=5). Agent traffic
+(tool-call JSON) drafts better than prose: 73-80% acceptance, ~5 accepted tokens per
+verification pass.
+
+## 5. Quick start
+
+```bash
+# build (CUDA >= 13.2.86, cmake >= 3.31 for sm_120a)
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=120a-real -DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON \
+  -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF
+cmake --build build -j12 --target llama-server
+
+# run: MTP-5 agent config on a 16GB card
+MODEL=/path/to/Qwen3.8-27B-UD-IQ4_XS-mtp-q4_0.gguf scripts-5060ti/start-mtp5.sh
+
+# run: TierKV long-context config (256K logical, 32K desk)
+LLAMA_KV_PAGER=1 LLAMA_KV_PAGER_WINDOW=32768 LLAMA_KV_PAGER_MAX_CTX=262144 \
+LLAMA_KV_PAGER_STAGE=1 LLAMA_KV_PAGER_SELECT=hybrid \
+build/bin/llama-server -m "$MODEL" -c 262144 --spec-type none -fa on -ctk q4_0 -ctv q4_0 -ngl 99
 ```
 
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
+Key TierKV environment variables (all optional; the fork is stock llama.cpp when unset):
 
-## Description
+| Variable | Meaning | Default |
+| --- | --- | --- |
+| `LLAMA_KV_PAGER` | enable the host-tier store | off |
+| `LLAMA_KV_PAGER_WINDOW` | VRAM window in tokens (logical `-c` can be larger) | = ctx |
+| `LLAMA_KV_PAGER_MAX_CTX` | logical capacity of the store | 262144 |
+| `LLAMA_KV_PAGER_STAGE` / `TOPK` / `QUERY` | retrieval staging (IDF + attention) | off / 8 / 64 |
+| `LLAMA_KV_PAGER_SELECT` | `lex` (word overlap) / `attn` (page-sparse) / `hybrid` | `lex` |
+| `LLAMA_KV_PAGER_HEAD` | protected head positions (system prompt) | 2048 |
+| `LLAMA_KV_PAGER_STAGE_EVERY` | min position advance between staging events | 1024 |
+| `LLAMA_KV_PAGER_HOST_Q4` | store host rows as Q4_0 even if the window is Q5_0 | off |
+| `LLAMA_KV_PAGER_SAVE` / `LOAD` / `AUTOSAVE` | SSD snapshots | off |
 
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
-a wide range of hardware - locally and in the cloud.
+## 6. Honest limitations
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+- **MTP + 256K is not possible on 16 GB with this implementation.** Mainline's MTP draft
+  context must cover the target's full position range, and its graph reserve grows with the
+  context (~1.1 GiB at 262,144). At 256K the server therefore runs *without* speculation
+  (22.7 tok/s). KVMem solved this with a windowed MTP pool plus state replay — porting that
+  is the top roadmap item and would put 256K decode in the 70-85 tok/s range.
+- **Retrieval coverage.** With a window much smaller than the working set, the model's KV no
+  longer matches the token stream the server sends; our selectors do not yet restore enough
+  of the agent's own recent history, and agents can lose the thread. Keep the window at or
+  above the working set (49K here) until the selector improves.
+- **The sparse attention is a gather, not a custom kernel.** Pages are staged into ordinary
+  KV cells and standard Flash-Attention runs over them; there is no paged-FA kernel yet.
+- The host store preallocates `MAX_CTX` worth of rows (lazily, on first save) — plan RAM
+  accordingly (~18.4 KB per token per sequence for Q4_0 K+V across 16 attention layers).
+- Benchmarks are single-run and agent wall-times include model-side behavior variance
+  (loops); scores are stable, timings are indicative.
 
-The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
+## 7. Credits and license
 
-## Supported backends
-
-| Backend | Target devices |
-| --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
-
-## Documentation
-
-#### Tools
-
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
-
-#### Development
-
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-- [Release process](docs/release.md)
-
-## Contributing
-
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
-
-## Acknowledgements
-
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+- Built on [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT) — all upstream code and
+  credit belongs to the llama.cpp authors.
+- Model: `Qwen3.8-27B-UD-IQ4_XS` (Unsloth), MTP head requantized to Q4_0.
+- The comparison point is [KVMem](https://github.com/kvmem/kvmem-llama.cpp); TierKV is an
+  independent design (three-tier store + page-sparse selection) that shares the goal of long
+  agent contexts on small cards.
+- Data and full experiment reports live in the companion repository
+  `5060ti-qwen3.8-27b` (`references/kv-paging-design.md`, `references/llama-next-mtp5-data.md`).

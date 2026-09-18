@@ -1,5 +1,11 @@
 # TierKV
 
+<p align="center">
+  <img src="assets/tierkv-logo.png" alt="TierKV logo" width="128" />
+</p>
+
+<p align="center"><strong>Keep the context. Keep the GPU small.</strong></p>
+
 **An independent fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) for running end-to-end
 coding-agent tasks on consumer GPUs with limited VRAM.**
 
@@ -59,6 +65,20 @@ Two signals decide which old pages are brought back to the desk:
    "page-sparse attention" part: attention effectively runs over a *selected subset* of pages
    plus the recent window, not over the whole history.
 
+### Architecture at a glance
+
+The two mechanisms compose without putting SSD I/O on the decode hot path: the host-tier store
+owns complete KV blocks, while the selector decides which summarized pages are gathered into the
+bounded device window for the current query.
+
+<p align="center">
+  <img src="assets/tierkv-architecture.svg" alt="TierKV three-tier storage and page-sparse attention architecture" width="100%" />
+</p>
+
+The diagram is intentionally literal about the current implementation: the sparse path is a
+page gather into ordinary KV cells, not a custom paged-Flash-Attention kernel; SSD snapshots are a
+cold-path session mechanism, not a per-token source of KV data.
+
 ## 3. What is in this fork
 
 | File | What it does |
@@ -68,7 +88,7 @@ Two signals decide which old pages are brought back to the desk:
 | `src/llama-graph.cpp` | Captures the last token's query per layer (`ggml_cpy` into a persistent tensor, CUDA-graph safe) |
 | `src/llama-model.cpp` | Decouples the VRAM window from the logical context; exempts MTP contexts from paging |
 | `common/speculative.cpp` | MTP draft context size cap (experimental) |
-| `scripts-5060ti/` | The tuned launcher, a decode/prefill probe, and the page-sparse cost prototype |
+| `scripts-5060ti/` | `start-tierkv-e2e.sh` (full-stack agent config), `start-mtp5.sh` (stage-1 baseline), a decode/prefill probe, and the page-sparse cost prototype |
 | `data/` | Raw experiment logs (sweeps, server logs, E2E artifacts) |
 
 ### Policy v2 (the parts that made it transparent)
@@ -134,13 +154,19 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF
 cmake --build build -j12 --target llama-server
 
-# run: MTP-5 agent config on a 16GB card
-MODEL=/path/to/Qwen3.8-27B-UD-IQ4_XS-mtp-q4_0.gguf scripts-5060ti/start-mtp5.sh
+# run A — TierKV full-stack agent config (the measured E2E: 100.0/100 in 398 s)
+#   VRAM window 49,152 | logical ctx 65,536 | Q4_0 KV + host store
+#   hybrid selector (IDF + page-sparse attention) | head protection | MTP-5
+MODEL=/path/to/Qwen3.8-27B-UD-IQ4_XS-mtp-q4_0.gguf scripts-5060ti/start-tierkv-e2e.sh
 
-# run: TierKV long-context config (256K logical, 32K desk)
+# run B — long-context config (256K logical, 32K desk, no speculation)
+#   (MTP cannot be windowed; see limitations. Decode is flat ~22.7 tok/s to 262K.)
 LLAMA_KV_PAGER=1 LLAMA_KV_PAGER_WINDOW=32768 LLAMA_KV_PAGER_MAX_CTX=262144 \
 LLAMA_KV_PAGER_STAGE=1 LLAMA_KV_PAGER_SELECT=hybrid \
 build/bin/llama-server -m "$MODEL" -c 262144 --spec-type none -fa on -ctk q4_0 -ctv q4_0 -ngl 99
+
+# stage-1 baseline (no TierKV): plain mainline llama.cpp + MTP-5
+MODEL=/path/to/Qwen3.8-27B-UD-IQ4_XS-mtp-q4_0.gguf scripts-5060ti/start-mtp5.sh
 ```
 
 Key TierKV environment variables (all optional; the fork is stock llama.cpp when unset):

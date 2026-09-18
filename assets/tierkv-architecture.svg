@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 760" width="1200" height="760" role="img" aria-labelledby="title desc">
+  <title id="title">TierKV architecture</title>
+  <desc id="desc">Tiered KV block storage across VRAM, host RAM and SSD, combined with page-sparse attention selecting top-k pages into a bounded active window.</desc>
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #111827; }
+    .title { font-size: 28px; font-weight: 700; }
+    .subtitle { font-size: 15px; fill: #6b7280; }
+    .label { font-size: 16px; font-weight: 700; }
+    .small { font-size: 13px; fill: #4b5563; }
+    .tiny { font-size: 12px; fill: #6b7280; }
+    .box { stroke: #d1d5db; stroke-width: 1.5; }
+  </style>
+  <defs>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0 0 10 4 0 8z" fill="#2563eb"/></marker>
+    <marker id="arrow-orange" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0 0 10 4 0 8z" fill="#f59e0b"/></marker>
+    <marker id="arrow-purple" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0 0 10 4 0 8z" fill="#9333ea"/></marker>
+  </defs>
+  <rect width="1200" height="760" fill="#fff"/>
+  <text x="48" y="48" class="title">TierKV · long context on a small GPU</text>
+  <text x="48" y="75" class="subtitle">Two mechanisms, three storage tiers: move blocks by turn; select pages per token.</text>
+
+  <!-- tier containers -->
+  <rect x="48" y="112" width="1104" height="142" rx="16" fill="#eff6ff" stroke="#bfdbfe" stroke-width="1.5"/>
+  <rect x="48" y="278" width="1104" height="142" rx="16" fill="#f0fdfa" stroke="#99f6e4" stroke-width="1.5"/>
+  <rect x="48" y="444" width="1104" height="142" rx="16" fill="#f9fafb" stroke="#d1d5db" stroke-width="1.5"/>
+  <text x="72" y="140" class="label" fill="#1d4ed8">VRAM · 16 GiB</text>
+  <text x="72" y="306" class="label" fill="#0f766e">RAM · 32 GiB</text>
+  <text x="72" y="472" class="label">SSD · 1.5 GB/s</text>
+  <text x="72" y="162" class="tiny">compute happens here</text>
+  <text x="72" y="328" class="tiny">durable in-process working set</text>
+  <text x="72" y="494" class="tiny">restart-safe session archive</text>
+
+  <!-- vram nodes -->
+  <rect x="280" y="140" width="260" height="82" rx="12" class="box" fill="#fff"/>
+  <text x="410" y="168" text-anchor="middle" class="label">Weights</text>
+  <text x="410" y="192" text-anchor="middle" class="small">Qwen3.8-27B · IQ4_XS</text>
+  <rect x="570" y="140" width="260" height="82" rx="12" class="box" fill="#fff"/>
+  <text x="700" y="168" text-anchor="middle" class="label">Active KV window</text>
+  <text x="700" y="192" text-anchor="middle" class="small">32–49K recent tokens</text>
+  <rect x="860" y="140" width="230" height="82" rx="12" class="box" fill="#fff7ed" stroke="#fed7aa"/>
+  <text x="975" y="168" text-anchor="middle" class="label">Staging buffer</text>
+  <text x="975" y="192" text-anchor="middle" class="small">top-k pages + sinks</text>
+
+  <!-- ram nodes -->
+  <rect x="280" y="306" width="350" height="82" rx="12" class="box" fill="#fff"/>
+  <text x="455" y="334" text-anchor="middle" class="label">Full KV block store</text>
+  <text x="455" y="358" text-anchor="middle" class="small">64-token blocks · host Q4_0 optional</text>
+  <rect x="660" y="306" width="300" height="82" rx="12" class="box" fill="#fff"/>
+  <text x="810" y="334" text-anchor="middle" class="label">Page summaries</text>
+  <text x="810" y="358" text-anchor="middle" class="small">IDF + K min/max bounds</text>
+
+  <!-- ssd nodes -->
+  <rect x="280" y="472" width="370" height="82" rx="12" class="box" fill="#fff"/>
+  <text x="465" y="500" text-anchor="middle" class="label">Session KV archives</text>
+  <text x="465" y="524" text-anchor="middle" class="small">save / load / autosave snapshots</text>
+  <rect x="700" y="472" width="260" height="82" rx="12" class="box" fill="#fff"/>
+  <text x="830" y="500" text-anchor="middle" class="label">Cold restart</text>
+  <text x="830" y="524" text-anchor="middle" class="small">resume without replaying history</text>
+
+  <!-- block movement -->
+  <path d="M455 388V458" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow-blue)"/>
+  <text x="472" y="428" class="small" fill="#2563eb">turn-boundary block copy</text>
+  <path d="M465 554V612H780V554" stroke="#9333ea" stroke-width="2.2" fill="none" marker-end="url(#arrow-purple)"/>
+  <text x="510" y="636" class="small" fill="#9333ea">session snapshot (cold path)</text>
+
+  <!-- sparse selector -->
+  <rect x="48" y="626" width="1104" height="92" rx="16" fill="#fff7ed" stroke="#fed7aa" stroke-width="1.5"/>
+  <text x="72" y="656" class="label">Mechanism 2 · page-sparse attention</text>
+  <text x="72" y="681" class="small">query per layer → score 64-token pages → stage top-k + sinks + recent window</text>
+  <path d="M810 388C930 410 1010 360 975 222" fill="none" stroke="#f59e0b" stroke-width="2.5" marker-end="url(#arrow-orange)"/>
+  <text x="986" y="334" class="small" fill="#b45309">per-token select</text>
+  <path d="M1090 181H1130V670H1082" fill="none" stroke="#f59e0b" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#arrow-orange)"/>
+  <text x="1038" y="699" class="tiny" fill="#b45309">bounded attention traffic</text>
+
+  <!-- legend -->
+  <line x1="70" y1="742" x2="98" y2="742" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow-blue)"/><text x="106" y="746" class="tiny">block movement</text>
+  <line x1="250" y1="742" x2="278" y2="742" stroke="#f59e0b" stroke-width="2.5" marker-end="url(#arrow-orange)"/><text x="286" y="746" class="tiny">page selection</text>
+  <line x1="420" y1="742" x2="448" y2="742" stroke="#9333ea" stroke-width="2.2" marker-end="url(#arrow-purple)"/><text x="456" y="746" class="tiny">snapshot / restore</text>
+</svg>

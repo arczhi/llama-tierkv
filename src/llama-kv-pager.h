@@ -74,6 +74,8 @@ struct llama_kv_pager {
     int64_t n_embd_k = 0;
     int64_t n_embd_v = 0;
     bool    host_q4 = false;
+    bool    store_ready = false;
+    void    ensure_store();
     uint32_t n_slots = 0;                 // max_ctx * n_seq
 
     std::vector<uint8_t>     slot_saved;  // [n_slots] 1 if a row is stored
@@ -85,6 +87,14 @@ struct llama_kv_pager {
     uint32_t                 pin_max = 512;
     uint32_t                 autosave_every = 0;
     uint64_t                 last_autosave = 0;
+    uint32_t                 head_protect = 2048;
+    uint32_t                 stage_every = 1024;
+    uint32_t                 stage_min = 32;
+    uint64_t                 last_stage_saves = 0;
+    int64_t                  last_stage_pos = -1;
+
+    // diagnostics
+    int      instance_id = 0;
 
     // stats
     uint64_t n_saves = 0, n_loads = 0, n_stage_calls = 0, n_staged = 0;
@@ -103,6 +113,8 @@ struct llama_kv_pager {
     bool     has_row(llama_seq_id seq, llama_pos pos) const;
     const uint8_t * peek_k(uint32_t ikv, llama_seq_id seq, llama_pos pos) const;
     bool     is_pinned(llama_seq_id seq, llama_pos pos) const;
+    bool     is_head(llama_pos pos) const;
+    bool     load_block(uint32_t ikv, uint32_t cell0, llama_seq_id seq, llama_pos pos0, uint32_t n);
     void     pin_row(llama_seq_id seq, llama_pos pos);
     void     unpin_row(llama_seq_id seq, llama_pos pos);
     int32_t  slot_of  (llama_seq_id seq, llama_pos pos) const;

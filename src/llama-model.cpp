@@ -2274,6 +2274,19 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
+    // kv pager: optionally decouple the VRAM cache window from the logical context size
+    uint32_t attn_kv_size = cparams.n_ctx_seq;
+    {
+        const char * pager_env = getenv("LLAMA_KV_PAGER");
+        if (pager_env && atoi(pager_env) != 0) {
+            const char * w = getenv("LLAMA_KV_PAGER_WINDOW");
+            if (w && atoi(w) > 0 && (uint32_t) atoi(w) < attn_kv_size) {
+                fprintf(stderr, "KV-PAGER: window = %u (logical ctx = %u)\n", (uint32_t) atoi(w), attn_kv_size);
+                attn_kv_size = (uint32_t) atoi(w);
+            }
+        }
+    }
+
     switch (arch) {
         // Models that need specific instantiation should be handled in the
         // switch statement
@@ -2597,7 +2610,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_type_v       */ params.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
                             /* attn_swa_full     */ params.swa_full,
-                            /* attn_kv_size      */ cparams.n_ctx_seq,
+                            /* attn_kv_size      */ attn_kv_size,
                             /* attn_n_ubatch     */ cparams.n_ubatch,
                             /* attn_n_pad        */ 1,
                             /* recurrent_type_r  */ GGML_TYPE_F32,
@@ -2616,7 +2629,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
-                            /* attn_kv_size      */ cparams.n_ctx_seq,
+                            /* attn_kv_size      */ attn_kv_size,
                             /* attn_n_pad        */ 1,
                             /* attn_n_swa        */ hparams.n_swa,
                             /* attn_swa_type     */ hparams.swa_type,
@@ -2636,7 +2649,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
-                            /* attn_kv_size      */ cparams.n_ctx_seq,
+                            /* attn_kv_size      */ attn_kv_size,
                             /* attn_n_pad        */ 1,
                             /* attn_n_swa        */ hparams.n_swa,
                             /* attn_swa_type     */ hparams.swa_type,

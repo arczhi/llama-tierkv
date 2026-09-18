@@ -364,6 +364,220 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+
+    pager_init();
+}
+
+//
+// kv pager
+//
+
+void llama_kv_cache::pager_init() {
+    std::vector<llama_kv_pager::layer_ref> refs;
+    refs.reserve(layers.size());
+    size_t k_row = 0;
+    size_t v_row = 0;
+    for (const auto & layer : layers) {
+        refs.push_back({ layer.k, layer.v });
+        if (k_row == 0 && layer.k != nullptr && layer.k->nb[1] > 0) {
+            k_row = layer.k->nb[1];
+        }
+        if (v_row == 0 && layer.v != nullptr && layer.v->nb[1] > 0) {
+            v_row = layer.v->nb[1];
+        }
+    }
+
+    pager = std::make_unique<llama_kv_pager>();
+    if (!pager->init(refs, k_row, v_row)) {
+        pager.reset();
+    }
+}
+
+void llama_kv_cache::pager_on_evict(uint32_t stream, uint32_t cell) {
+    if (!pager || !pager->enabled) {
+        return;
+    }
+
+    auto & cells = v_cells[stream];
+    if (cells.is_empty(cell)) {
+        return;
+    }
+
+    const llama_seq_id seq = cells.seq_get(cell);
+    const llama_pos    pos = cells.pos_get(cell);
+    const llama_token  tok = has_cell_ext() ? cells.ext_get(cell).tok : -1;
+
+    for (uint32_t ikv = 0; ikv < layers.size(); ++ikv) {
+        pager->save_row(ikv, cell, seq, pos, tok);
+    }
+}
+
+void llama_kv_cache::pager_make_room(uint32_t n_tokens) {
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        auto & cells = v_cells[s];
+
+        const uint32_t size = cells.size();
+        uint32_t used = cells.get_used();
+
+        if (used + n_tokens + n_pad <= size) {
+            continue;
+        }
+
+        // evict oldest cells (smallest position) until enough room is available, saving them first
+        std::vector<std::pair<llama_pos, uint32_t>> occ;
+        occ.reserve(used);
+        for (uint32_t i = 0; i < size; ++i) {
+            if (!cells.is_empty(i)) {
+                occ.emplace_back(cells.pos_get(i), i);
+            }
+        }
+        std::sort(occ.begin(), occ.end());
+
+        const uint32_t target_free = n_tokens + n_pad;
+        for (const auto & [pos, cell] : occ) {
+            if (size - used >= target_free) {
+                break;
+            }
+            // pinned (staged) rows survive eviction pressure
+            if (pager->is_pinned(cells.seq_get(cell), pos)) {
+                continue;
+            }
+            pager->log("%s: evicting cell=%u pos=%d (used=%u/%u)\n", __func__, cell, pos, used, size);
+            pager_on_evict(s, cell);
+            cells.rm(cell);
+            --used;
+        }
+
+        if (size - used < target_free) {
+            pager->log("%s: WARNING only %u free cells after eviction, wanted %u\n", __func__, size - used, target_free);
+        }
+    }
+}
+
+bool llama_kv_cache::pager_place(uint32_t stream, uint32_t cell, llama_seq_id seq, llama_pos pos, llama_token tok) {
+    auto & cells = v_cells[stream];
+
+    cells.rm(cell);
+    cells.pos_set(cell, pos);
+    cells.seq_add(cell, seq);
+    if (has_cell_ext()) {
+        llama_kv_cell_ext ext;
+        ext.tok = tok;
+        cells.ext_set(cell, ext);
+    }
+    return true;
+}
+
+bool llama_kv_cache::pager_block_resident(uint32_t stream, llama_seq_id seq, uint32_t p0, uint32_t p1) const {
+    const auto & cells = v_cells[stream];
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.is_empty(i)) {
+            continue;
+        }
+        if (cells.seq_has(i, seq) && cells.pos_in(i, (llama_pos) p0, (llama_pos) p1)) {
+            // debug: verify the resident copy against the host store (layer 0)
+            if (pager->debug && !layers.empty() && layers[0].k) {
+                const llama_pos pos = cells.pos_get(i);
+                const uint8_t * ref = pager->peek_k(0, seq, pos);
+                if (ref) {
+                    std::vector<uint8_t> dev(k_row_probe());
+                    ggml_backend_tensor_get(layers[0].k, dev.data(), (size_t) i * layers[0].k->nb[1], dev.size());
+                    const bool same = memcmp(dev.data(), ref, dev.size()) == 0;
+                    fprintf(stderr, "KV-PAGER verify: cell=%u pos=%d %s\n", i, pos, same ? "MATCH" : "MISMATCH");
+                } else {
+                    fprintf(stderr, "KV-PAGER verify: cell=%u pos=%d no host row\n", i, pos);
+                }
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t llama_kv_cache::k_row_probe() const {
+    return layers.empty() || !layers[0].k ? 0 : layers[0].k->nb[1];
+}
+
+void llama_kv_cache::pager_stage(const llama_ubatch & ubatch) {
+    if (!pager || !pager->enabled || !pager->stage) {
+        return;
+    }
+    if (ubatch.token == nullptr || ubatch.n_tokens == 0) {
+        return;
+    }
+
+    ++pager->n_stage_calls;
+
+    // query = trailing tokens of the incoming ubatch
+    const uint32_t nq = std::min<uint32_t>(ubatch.n_tokens, pager->query_len);
+    const llama_token * q = ubatch.token + (ubatch.n_tokens - nq);
+
+    const auto blocks = pager->select_blocks(q, nq);
+    if (blocks.empty()) {
+        return;
+    }
+
+    uint32_t n_staged = 0;
+
+    for (const uint32_t b : blocks) {
+        const uint32_t p0 = b * pager->block_tokens;
+        const uint32_t p1 = std::min<uint32_t>(p0 + pager->block_tokens, pager->max_ctx);
+
+        if (pager_block_resident(0, 0, p0, p1)) {
+            pager->log("%s: block %u [%u,%u) already resident, skip\n", __func__, b, p0, p1);
+            continue;
+        }
+
+        uint32_t n_saved_rows = 0;
+        for (uint32_t p = p0; p < p1; ++p) {
+            const int32_t slot = pager->slot_of(0, (llama_pos) p);
+            if (slot >= 0 && pager->slot_saved[slot]) {
+                ++n_saved_rows;
+            }
+        }
+        pager->log("%s: block %u [%u,%u) not resident, %u/%u rows saved\n", __func__, b, p0, p1, n_saved_rows, p1 - p0);
+
+        for (uint32_t p = p0; p < p1; ++p) {
+            const int32_t slot = pager->slot_of(0, (llama_pos) p);
+            if (slot < 0 || !pager->slot_saved[slot]) {
+                continue;
+            }
+
+            // find a free cell
+            int32_t cell = -1;
+            for (uint32_t i = 0; i < v_cells[0].size(); ++i) {
+                if (v_cells[0].is_empty(i)) {
+                    cell = (int32_t) i;
+                    break;
+                }
+            }
+            if (cell < 0) {
+                pager->log("%s: no free cell to stage block %u pos %u\n", __func__, b, p);
+                return;
+            }
+
+            pager_place(0, (uint32_t) cell, 0, (llama_pos) p, pager->slot_tok[slot]);
+            for (uint32_t ikv = 0; ikv < layers.size(); ++ikv) {
+                pager->load_row(ikv, (uint32_t) cell, 0, (llama_pos) p);
+            }
+            pager->pin_row(0, (llama_pos) p);
+            ++n_staged;
+        }
+    }
+
+    pager->n_staged += n_staged;
+    pager->log("%s: staged %u rows from %zu selected blocks (total staged %llu)\n",
+            __func__, n_staged, blocks.size(), (unsigned long long) pager->n_staged);
+}
+
+void llama_kv_cache::pager_finish() {
+    if (pager && pager->enabled && !pager->save_path.empty()) {
+        pager->save_to_file(pager->save_path);
+    }
+}
+
+llama_kv_cache::~llama_kv_cache() {
+    pager_finish();
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -407,6 +621,15 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                 continue;
             }
 
+            if (pager && pager->enabled && !cells.is_empty(i) &&
+                pager->is_pinned(seq_id, cells.pos_get(i))) {
+                continue; // staged block: keep it resident
+            }
+
+            if (cells.seq_has(i, seq_id)) {
+                pager_on_evict(seq_to_stream[seq_id], i);
+            }
+
             if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
                 if (new_head == cells.size()) {
                     new_head = i;
@@ -430,6 +653,13 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                 if (!cells.pos_in(i, p0, p1)) {
                     continue;
                 }
+
+                if (pager && pager->enabled && !cells.is_empty(i) &&
+                    pager->is_pinned(cells.seq_get(i), cells.pos_get(i))) {
+                    continue; // staged block: keep it resident
+                }
+
+                pager_on_evict(s, i);
 
                 cells.rm(i);
 
@@ -750,6 +980,20 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
     llama_kv_cache::slot_info_vec_t res;
+
+    // free room for the incoming tokens, saving evicted KV rows to the host store
+    if (pager && pager->enabled) {
+        uint32_t n_new = 0;
+        for (const auto & ubatch : ubatches) {
+            n_new += ubatch.n_tokens;
+        }
+        pager_make_room(n_new);
+    }
+
+    // stage retrieved KV blocks into free cells before looking for slots for the new tokens
+    if (pager && pager->enabled && pager->stage && !ubatches.empty()) {
+        pager_stage(ubatches[0]);
+    }
 
     struct state_t {
         slot_info sinfo; // slot info for the ubatch
@@ -1124,6 +1368,8 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                 const llama_pos    pos    = cells.pos_get(idx);
 
                 seq_pos_max_rm[seq_id] = std::max(seq_pos_max_rm[seq_id], pos);
+
+                pager_on_evict(sinfo.strm[s], idx);
 
                 cells.rm(idx);
             }

@@ -3,6 +3,7 @@
 #include "llama-batch.h"
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
+#include "llama-kv-pager.h"
 #include "llama-memory.h"
 
 #include <unordered_map>
@@ -116,7 +117,7 @@ public:
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "");
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache();
 
     //
     // llama_memory_i
@@ -178,6 +179,19 @@ public:
       llama_state_seq_flags   flags,
           slot_info_vec_t *   sinfos_out,
     const slot_info_vec_t *   sinfos_in);
+
+    //
+    // kv pager (host-tier KV store) - see llama-kv-pager.h
+    //
+
+    llama_kv_pager * get_pager() const { return pager.get(); }
+
+    bool pager_place(uint32_t stream, uint32_t cell, llama_seq_id seq, llama_pos pos, llama_token tok);
+    bool pager_block_resident(uint32_t stream, llama_seq_id seq, uint32_t p0, uint32_t p1) const;
+    size_t k_row_probe() const;
+    void pager_make_room(uint32_t n_tokens);
+    void pager_stage(const llama_ubatch & ubatch);
+    void pager_finish();
 
     //
     // graph_build API
@@ -297,6 +311,12 @@ private:
 
     // TODO: temporary until we refactor to be able to share the same cells between 2 kv caches [TAG_KV_CACHE_SHARE_CELLS]
     llama_kv_cache * other;
+
+    // host-tier KV store (disabled by default; see llama-kv-pager.h)
+    std::unique_ptr<llama_kv_pager> pager;
+
+    void pager_init();
+    void pager_on_evict(uint32_t stream, uint32_t cell);
 
     std::shared_ptr<llama_kv_cells_vec> v_cells_impl;
 

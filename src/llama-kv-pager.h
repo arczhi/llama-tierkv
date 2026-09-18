@@ -21,14 +21,18 @@
 //   LLAMA_KV_PAGER_STAGE=1        enable retrieval staging (2.4; default: off)
 //   LLAMA_KV_PAGER_TOPK=N         blocks staged per prepare() call (default: 8)
 //   LLAMA_KV_PAGER_QUERY=N        number of trailing tokens used as the query (default: 64)
-//   LLAMA_KV_PAGER_SAVE=PATH      save the store to PATH on first clear/exit (2.6)
+//   LLAMA_KV_PAGER_SAVE=PATH      store file for autosave/exit snapshots (2.6)
+//   LLAMA_KV_PAGER_AUTOSAVE=N     save the store every N saved rows (default 0 = off)
 //   LLAMA_KV_PAGER_LOAD=PATH      load the store from PATH at init (2.6)
 //   LLAMA_KV_PAGER_DEBUG=1        verbose logging
 
 #include "ggml.h"
 #include "llama.h"
 
+#include <cstddef>
+
 #include <cstdint>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -56,22 +60,36 @@ struct llama_kv_pager {
     std::vector<layer_ref> layers;        // one entry per kv layer
     std::vector<std::vector<uint8_t>> k_host; // [layer][slot * k_row]
     std::vector<std::vector<uint8_t>> v_host; // [layer][slot * v_row]
-    size_t k_row = 0;
+    size_t k_row = 0;                 // host row bytes
     size_t v_row = 0;
+    size_t k_row_cache = 0;           // VRAM row bytes (cache type)
+    size_t v_row_cache = 0;
+    ggml_type type_k_cache = GGML_TYPE_F32;
+    ggml_type type_v_cache = GGML_TYPE_F32;
+    ggml_type type_k_host  = GGML_TYPE_F32;
+    ggml_type type_v_host  = GGML_TYPE_F32;
+    int64_t n_embd_k = 0;
+    int64_t n_embd_v = 0;
+    bool    host_q4 = false;
     uint32_t n_slots = 0;                 // max_ctx * n_seq
 
     std::vector<uint8_t>     slot_saved;  // [n_slots] 1 if a row is stored
     std::vector<llama_token> slot_tok;    // [n_slots] token id (may be -1)
     std::vector<uint8_t>     slot_pinned; // [n_slots] 1 if staged and protected from eviction
+    std::unordered_map<llama_token, uint32_t> tok_freq; // token frequency over stored rows (idf proxy)
+    uint64_t                 tok_freq_total = 0;
     std::vector<int32_t>     pin_fifo;    // staged slots in order (for FIFO unpinning)
     uint32_t                 pin_max = 512;
+    uint32_t                 autosave_every = 0;
+    uint64_t                 last_autosave = 0;
 
     // stats
     uint64_t n_saves = 0, n_loads = 0, n_stage_calls = 0, n_staged = 0;
 
     // -- lifecycle ------------------------------------------------------------
     // read env, allocate the host store; returns false if disabled
-    bool init(const std::vector<layer_ref> & layers_in, size_t k_row_in, size_t v_row_in);
+    bool init(const std::vector<layer_ref> & layers_in, size_t k_row_cache_in, size_t v_row_cache_in,
+              ggml_type type_k_cache_in, ggml_type type_v_cache_in, int64_t n_embd_k_in, int64_t n_embd_v_in);
 
     // -- store ops ------------------------------------------------------------
     // save the row at `cell` of kv-layer `ikv` into host slot (seq,pos)

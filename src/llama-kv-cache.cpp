@@ -387,8 +387,13 @@ void llama_kv_cache::pager_init() {
         }
     }
 
+    ggml_type type_k = layers.empty() || !layers[0].k ? GGML_TYPE_F32 : layers[0].k->type;
+    ggml_type type_v = layers.empty() || !layers[0].v ? GGML_TYPE_F32 : layers[0].v->type;
+    const int64_t n_embd_k = layers.empty() || !layers[0].k ? 0 : layers[0].k->ne[0];
+    const int64_t n_embd_v = layers.empty() || !layers[0].v ? 0 : layers[0].v->ne[0];
+
     pager = std::make_unique<llama_kv_pager>();
-    if (!pager->init(refs, k_row, v_row)) {
+    if (!pager->init(refs, k_row, v_row, type_k, type_v, n_embd_k, n_embd_v)) {
         pager.reset();
     }
 }

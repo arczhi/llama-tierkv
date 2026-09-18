@@ -3,6 +3,8 @@
 #include "ggml-backend.h"
 #include "llama-impl.h"
 
+#include <cstdlib>
+
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
@@ -31,7 +33,14 @@ void llama_kv_pager::log(const char * fmt, ...) const {
     fflush(stderr);
 }
 
-bool llama_kv_pager::init(const std::vector<layer_ref> & layers_in, size_t k_row_in, size_t v_row_in) {
+static bool row_is_convertible(ggml_type t) {
+    const ggml_type_traits * tr = ggml_get_type_traits(t);
+    return tr != nullptr && tr->to_float != nullptr;
+}
+
+bool llama_kv_pager::init(const std::vector<layer_ref> & layers_in, size_t k_row_cache_in, size_t v_row_cache_in,
+                          ggml_type type_k_cache_in, ggml_type type_v_cache_in,
+                          int64_t n_embd_k_in, int64_t n_embd_v_in) {
     enabled = env_flag("LLAMA_KV_PAGER", false);
     if (!enabled) return false;
 
@@ -43,6 +52,22 @@ bool llama_kv_pager::init(const std::vector<layer_ref> & layers_in, size_t k_row
     query_len    = env_u32("LLAMA_KV_PAGER_QUERY", 64);
     debug        = env_flag("LLAMA_KV_PAGER_DEBUG", false);
     pin_max = env_u32("LLAMA_KV_PAGER_PIN_MAX", 512);
+
+    k_row_cache  = k_row_cache_in;
+    v_row_cache  = v_row_cache_in;
+    type_k_cache = type_k_cache_in;
+    type_v_cache = type_v_cache_in;
+    n_embd_k     = n_embd_k_in;
+    n_embd_v     = n_embd_v_in;
+
+    host_q4     = env_flag("LLAMA_KV_PAGER_HOST_Q4", false) && row_is_convertible(type_k_cache);
+    type_k_host = host_q4 ? GGML_TYPE_Q4_0 : type_k_cache;
+    type_v_host = host_q4 ? GGML_TYPE_Q4_0 : type_v_cache;
+
+    // host rows may use a different type than the VRAM cache -> recompute host row sizes
+    k_row = host_q4 ? ggml_row_size(type_k_host, n_embd_k) : k_row_cache;
+    v_row = host_q4 ? ggml_row_size(type_v_host, n_embd_v) : v_row_cache;
+    autosave_every = env_u32("LLAMA_KV_PAGER_AUTOSAVE", 0);
     if (const char * p = getenv("LLAMA_KV_PAGER_SAVE")) save_path = p;
     if (const char * p = getenv("LLAMA_KV_PAGER_LOAD")) load_path = p;
 
@@ -50,8 +75,6 @@ bool llama_kv_pager::init(const std::vector<layer_ref> & layers_in, size_t k_row
     n_slots = max_ctx * n_seq;
 
     layers = layers_in;
-    k_row = k_row_in;
-    v_row = v_row_in;
 
     k_host.resize(layers.size());
     v_host.resize(layers.size());
@@ -63,8 +86,10 @@ bool llama_kv_pager::init(const std::vector<layer_ref> & layers_in, size_t k_row
     slot_tok.assign(n_slots, -1);
     slot_pinned.assign(n_slots, 0);
 
-    fprintf(stderr, "KV-PAGER: enabled max_ctx=%u block=%u seq=%u stage=%d topk=%u layers=%zu k_row=%zu v_row=%zu store=%.1f MiB\n",
-            max_ctx, block_tokens, n_seq, (int) stage, topk, layers.size(), k_row, v_row,
+    fprintf(stderr, "KV-PAGER: enabled max_ctx=%u block=%u seq=%u stage=%d topk=%u layers=%zu "
+            "cache_rows k=%zu v=%zu host_rows k=%zu v=%zu host_q4=%d store=%.1f MiB\n",
+            max_ctx, block_tokens, n_seq, (int) stage, topk, layers.size(),
+            k_row_cache, v_row_cache, k_row, v_row, (int) host_q4,
             (k_host.size() * n_slots * (k_row + v_row)) / 1024.0 / 1024.0);
     fflush(stderr);
 
@@ -134,16 +159,44 @@ void llama_kv_pager::save_row(uint32_t ikv, uint32_t cell, llama_seq_id seq, lla
 
     const auto & L = layers[ikv];
     if (L.k && k_row) {
-        ggml_backend_tensor_get(L.k, k_host[ikv].data() + (size_t) slot * k_row,
-                                (size_t) cell * L.k->nb[1], k_row);
+        if (host_q4) {
+            std::vector<float> f32(n_embd_k);
+            std::vector<uint8_t> q(k_row_cache);
+            ggml_backend_tensor_get(L.k, q.data(), (size_t) cell * L.k->nb[1], k_row_cache);
+            ggml_get_type_traits(type_k_cache)->to_float(q.data(), f32.data(), n_embd_k);
+            ggml_quantize_chunk(type_k_host, f32.data(), k_host[ikv].data() + (size_t) slot * k_row,
+                                0, 1, n_embd_k, nullptr);
+        } else {
+            ggml_backend_tensor_get(L.k, k_host[ikv].data() + (size_t) slot * k_row,
+                                    (size_t) cell * L.k->nb[1], k_row);
+        }
     }
     if (L.v && v_row) {
-        ggml_backend_tensor_get(L.v, v_host[ikv].data() + (size_t) slot * v_row,
-                                (size_t) cell * L.v->nb[1], v_row);
+        if (host_q4) {
+            std::vector<float> f32(n_embd_v);
+            std::vector<uint8_t> q(v_row_cache);
+            ggml_backend_tensor_get(L.v, q.data(), (size_t) cell * L.v->nb[1], v_row_cache);
+            ggml_get_type_traits(type_v_cache)->to_float(q.data(), f32.data(), n_embd_v);
+            ggml_quantize_chunk(type_v_host, f32.data(), v_host[ikv].data() + (size_t) slot * v_row,
+                                0, 1, n_embd_v, nullptr);
+        } else {
+            ggml_backend_tensor_get(L.v, v_host[ikv].data() + (size_t) slot * v_row,
+                                    (size_t) cell * L.v->nb[1], v_row);
+        }
     }
     slot_saved[slot] = 1;
     slot_tok[slot] = tok;
+    if (ikv == 0 && tok >= 0) {
+        tok_freq[tok]++;
+        tok_freq_total++;
+    }
     ++n_saves;
+
+    if (ikv == layers.size() - 1 && !save_path.empty() && autosave_every > 0 &&
+        (n_saves - last_autosave) >= autosave_every) {
+        last_autosave = n_saves;
+        save_to_file(save_path);
+    }
     log("%s: saved kv layer=%u cell=%u seq=%d pos=%d tok=%d (slot=%d, total=%llu)\n",
         __func__, ikv, cell, seq, pos, tok, slot, (unsigned long long) n_saves);
 }
@@ -155,12 +208,30 @@ bool llama_kv_pager::load_row(uint32_t ikv, uint32_t cell, llama_seq_id seq, lla
 
     const auto & L = layers[ikv];
     if (L.k && k_row) {
-        ggml_backend_tensor_set(L.k, k_host[ikv].data() + (size_t) slot * k_row,
-                                (size_t) cell * L.k->nb[1], k_row);
+        if (host_q4) {
+            std::vector<float> f32(n_embd_k);
+            std::vector<uint8_t> q(k_row_cache);
+            ggml_get_type_traits(type_k_host)->to_float(k_host[ikv].data() + (size_t) slot * k_row,
+                                                        f32.data(), n_embd_k);
+            ggml_quantize_chunk(type_k_cache, f32.data(), q.data(), 0, 1, n_embd_k, nullptr);
+            ggml_backend_tensor_set(L.k, q.data(), (size_t) cell * L.k->nb[1], k_row_cache);
+        } else {
+            ggml_backend_tensor_set(L.k, k_host[ikv].data() + (size_t) slot * k_row,
+                                    (size_t) cell * L.k->nb[1], k_row);
+        }
     }
     if (L.v && v_row) {
-        ggml_backend_tensor_set(L.v, v_host[ikv].data() + (size_t) slot * v_row,
-                                (size_t) cell * L.v->nb[1], v_row);
+        if (host_q4) {
+            std::vector<float> f32(n_embd_v);
+            std::vector<uint8_t> q(v_row_cache);
+            ggml_get_type_traits(type_v_host)->to_float(v_host[ikv].data() + (size_t) slot * v_row,
+                                                        f32.data(), n_embd_v);
+            ggml_quantize_chunk(type_v_cache, f32.data(), q.data(), 0, 1, n_embd_v, nullptr);
+            ggml_backend_tensor_set(L.v, q.data(), (size_t) cell * L.v->nb[1], v_row_cache);
+        } else {
+            ggml_backend_tensor_set(L.v, v_host[ikv].data() + (size_t) slot * v_row,
+                                    (size_t) cell * L.v->nb[1], v_row);
+        }
     }
     ++n_loads;
     return true;
@@ -208,19 +279,28 @@ std::vector<uint32_t> llama_kv_pager::select_blocks(const llama_token * query, u
         fprintf(stderr, "\n");
     }
 
-    std::vector<std::pair<uint32_t, uint32_t>> scored; // (score, block)
+    // idf-style weight: rare tokens dominate, high-frequency tokens (digits, filler) are discounted
+    const double df_total = (double) std::max<uint64_t>(1, tok_freq_total);
+    auto weight = [&](llama_token t) -> double {
+        const auto it = tok_freq.find(t);
+        const double f = it == tok_freq.end() ? 0.0 : (double) it->second;
+        return 1.0 + 1000.0 / (1.0 + f);
+    };
+
+    std::vector<std::pair<double, uint32_t>> scored; // (score, block)
     for (uint32_t b = 0; b < n_blocks; ++b) {
-        uint32_t score = 0;
+        double score = 0.0;
         const uint32_t p0 = b * block_tokens;
         const uint32_t p1 = std::min<uint32_t>(p0 + block_tokens, max_ctx);
         for (uint32_t p = p0; p < p1; ++p) {
             const int32_t s = slot_of(0, (llama_pos) p);
             if (s >= 0 && slot_saved[s] && slot_tok[s] >= 0 && q.count(slot_tok[s])) {
-                ++score;
+                score += weight(slot_tok[s]);
             }
         }
-        if (score > 0) scored.emplace_back(score, b);
+        if (score > 0.0) scored.emplace_back(score, b);
     }
+    (void) df_total;
     std::sort(scored.begin(), scored.end(), [](const auto & a, const auto & b) {
         return a.first != b.first ? a.first > b.first : a.second < b.second; // score desc, block asc
     });
@@ -231,7 +311,7 @@ std::vector<uint32_t> llama_kv_pager::select_blocks(const llama_token * query, u
     if (debug) {
         fprintf(stderr, "KV-PAGER select: %zu candidate blocks, top:", scored.size());
         for (size_t i = 0; i < res.size(); ++i) {
-            fprintf(stderr, " b%u(s%u,tok%lld)", res[i], scored[i].first,
+            fprintf(stderr, " b%u(s%.0f,tok%lld)", res[i], scored[i].first,
                     (long long) (slot_tok[slot_of(0, (llama_pos) (res[i] * block_tokens))]));
         }
         fprintf(stderr, "\n");
@@ -249,9 +329,13 @@ bool llama_kv_pager::save_to_file(const std::string & path) const {
         return false;
     }
     const uint32_t magic   = 0x4750564bu; // "KVPG"
-    const uint32_t version = 1;
+    const uint32_t version = 2;
     const uint32_t n_layer = (uint32_t) layers.size();
     const uint64_t kr = k_row, vr = v_row;
+    const uint32_t tkc = (uint32_t) type_k_cache;
+    const uint32_t tvc = (uint32_t) type_v_cache;
+    const uint32_t tkh = (uint32_t) type_k_host;
+    const uint32_t tvh = (uint32_t) type_v_host;
 
     bool ok = true;
     ok &= write_all(f, &magic, 4);
@@ -262,6 +346,10 @@ bool llama_kv_pager::save_to_file(const std::string & path) const {
     ok &= write_all(f, &n_layer, 4);
     ok &= write_all(f, &kr, 8);
     ok &= write_all(f, &vr, 8);
+    ok &= write_all(f, &tkc, 4);
+    ok &= write_all(f, &tvc, 4);
+    ok &= write_all(f, &tkh, 4);
+    ok &= write_all(f, &tvh, 4);
     ok &= write_all(f, slot_saved.data(), slot_saved.size());
     ok &= write_all(f, slot_tok.data(), slot_tok.size() * sizeof(llama_token));
     for (uint32_t il = 0; il < n_layer && ok; ++il) {
@@ -286,6 +374,7 @@ bool llama_kv_pager::load_from_file(const std::string & path) {
     uint32_t magic = 0, version = 0, n_layer = 0;
     uint64_t kr = 0, vr = 0;
     uint32_t mctx = 0, btok = 0, nseq = 0;
+    uint32_t tkc = 0, tvc = 0, tkh = 0, tvh = 0;
     bool ok = true;
     ok &= read_all(f, &magic, 4);
     ok &= read_all(f, &version, 4);
@@ -295,9 +384,22 @@ bool llama_kv_pager::load_from_file(const std::string & path) {
     ok &= read_all(f, &n_layer, 4);
     ok &= read_all(f, &kr, 8);
     ok &= read_all(f, &vr, 8);
+    ok &= read_all(f, &tkc, 4);
+    ok &= read_all(f, &tvc, 4);
+    ok &= read_all(f, &tkh, 4);
+    ok &= read_all(f, &tvh, 4);
 
-    if (!ok || magic != 0x4750564bu || version != 1) {
+    if (!ok || magic != 0x4750564bu || (version != 1 && version != 2)) {
         LLAMA_LOG_ERROR("%s: '%s' is not a kv-pager store\n", __func__, path.c_str());
+        fclose(f);
+        return false;
+    }
+    if (version == 2 &&
+        (tkc != (uint32_t) type_k_cache || tvc != (uint32_t) type_v_cache ||
+         tkh != (uint32_t) type_k_host  || tvh != (uint32_t) type_v_host)) {
+        fprintf(stderr, "KV-PAGER: store type mismatch (file k=%u/%u v=%u/%u, current k=%u/%u v=%u/%u)\n",
+                tkc, tkh, tvc, tvh, (uint32_t) type_k_cache, (uint32_t) type_k_host,
+                (uint32_t) type_v_cache, (uint32_t) type_v_host);
         fclose(f);
         return false;
     }
